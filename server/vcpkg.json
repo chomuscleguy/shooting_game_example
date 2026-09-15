@@ -1,0 +1,8 @@
+{
+  "name": "shooting-game-server",
+  "version": "0.1.0",
+  "builtin-baseline": "9e44ec0e9f247d77c230ced0ee66c76296837807",
+  "dependencies": [
+    "boost-asio"
+  ]
+}

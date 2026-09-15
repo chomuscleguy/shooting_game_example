@@ -1,0 +1,16 @@
+# ---- Visual Studio / CMake build output ----
+build/
+out/
+.vs/
+CMakeFiles/
+CMakeCache.txt
+*.obj
+*.ilk
+*.pdb
+
+# ---- vcpkg ----
+vcpkg_installed/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
