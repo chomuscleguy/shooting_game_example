@@ -30,7 +30,8 @@ public:
 		}
 	}
 
-	Session(tcp::socket socket) : socket_(std::move(socket)) {}
+	Session(tcp::socket socket, uint64_t player_id)
+		: socket_(std::move(socket)), player_id_(player_id) {}
 
 	void start() {
 		do_read_header();
@@ -97,25 +98,69 @@ private:
 	void handle_message(const std::string& raw) {
 		try {
 			nlohmann::json msg = nlohmann::json::parse(raw);
-
 			std::string type = msg.value("type", "");
 			nlohmann::json data = msg.value("data", nlohmann::json::object());
 
-			std::cout << "type=" << type << ", data=" << data.dump() << '\n';
+			// Login은 로그인 전에도 허용
+			if (type == "Login") {
+				handle_login(data);
+				return;
+			}
+
+			// 그 외 모든 메시지는 로그인 필수
+			if (!logged_in_) {
+				send_error("login required");
+				return;
+			}
 
 			if (type == "Ping") {
 				send({ {"type", "Pong"}, {"data", nlohmann::json::object()} });
+				return;
 			}
+
+			send_error("unknown message type: " + type);
 		}
 		catch (const std::exception& e) {
 			std::cerr << "JSON parse error: " << e.what() << '\n';
 		}
 	}
 
+	void handle_login(const nlohmann::json& data) {
+		if (logged_in_) {
+			send_error("already logged in");
+			return;
+		}
+
+		std::string username = data.value("username", "");
+		if (username.empty()) {
+			send_error("username required");
+			return;
+		}
+
+		username_ = username;
+		logged_in_ = true;
+
+		std::cout << "Login: " << username_ << " (id=" << player_id_ << ")\n";
+
+		nlohmann::json ok;
+		ok["playerId"] = player_id_;
+		ok["username"] = username_;
+		send({ {"type", "LoginOk"}, {"data", ok} });
+	}
+
+	void send_error(const std::string& message) {
+		nlohmann::json err;
+		err["message"] = message;
+		send({ {"type", "Error"}, {"data", err} });
+	}
+
 	tcp::socket socket_;
 	unsigned char header_[4];
 	std::string body_;
 	std::deque<std::string> write_queue_;
+	uint64_t player_id_;
+	std::string username_;
+	bool logged_in_ = false;
 };
 
 int main() {
@@ -124,12 +169,14 @@ int main() {
 		tcp::acceptor acceptor(io, tcp::endpoint(tcp::v4(), 7777));
 		std::cout << "Listening on port 7777..." << '\n';
 
+		uint64_t next_player_id = 1;
+
 		std::function<void()> do_accept;
 		do_accept = [&]() {
 			acceptor.async_accept([&](boost::system::error_code ec, tcp::socket socket) {
 				if (!ec) {
 					std::cout << "Client connected: " << socket.remote_endpoint() << '\n';
-					std::make_shared<Session>(std::move(socket))->start();
+					std::make_shared<Session>(std::move(socket), next_player_id++)->start();
 				}
 				do_accept();
 				});

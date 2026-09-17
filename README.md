@@ -11,7 +11,7 @@
 - [x] Step 2: 받은 데이터를 그대로 돌려주는 echo 서버
 - [x] Step 3: 여러 명이 동시에 접속 가능하게 (async_accept + io_context)
 - [x] Step 4: 길이-prefix + JSON 프로토콜 얹기
-- [ ] Step 5: 로그인 (유저네임)
+- [x] Step 5: 로그인 (유저네임)
 - [ ] Step 6: 방 생성/참여/퇴장
 - [ ] Step 7: 채팅 (방 단위 브로드캐스트)
 - [ ] Step 8: 매칭 큐 + 보스 스폰
@@ -20,16 +20,74 @@
 - [ ] Step 11: 친구 (요청/수락/목록)
 - [ ] Step 12: 라즈베리파이 배포 (systemd 서비스로 상시 구동)
 
+## 프로젝트 구조
+
+```
+server/
+  CMakeLists.txt
+  CMakePresets.json      vcpkg 툴체인 경로 지정
+  vcpkg.json             의존성 선언 (boost-asio, nlohmann-json)
+  src/main.cpp           서버 전체 (Session 클래스 + main)
+tools/
+  test-client.ps1        PowerShell 임시 테스트 클라이언트
+```
+
+클라이언트(Unity)는 아직 없음. 서버가 어느 정도 완성된 뒤 붙일 예정.
+
+## 프로토콜
+
+모든 메시지는 `[4바이트 빅엔디안 길이][UTF-8 JSON 본문]` 형태로 감싸서 주고받는다.
+본문 구조는 `{"type": "...", "data": {...}}`.
+
+**Client → Server**
+
+| type | data | 설명 |
+|---|---|---|
+| `Login` | `{"username": "alice"}` | 로그인. 이것만 로그인 전에 허용됨 |
+| `Ping` | `{}` | 연결 확인 |
+
+**Server → Client**
+
+| type | data | 설명 |
+|---|---|---|
+| `LoginOk` | `{"playerId": 1, "username": "alice"}` | 로그인 성공 |
+| `Pong` | `{}` | Ping 응답 |
+| `Error` | `{"message": "login required"}` | 요청 거부. 사유를 메시지로 전달 |
+
 ## 빌드
 
 Windows + Visual Studio + vcpkg:
-1. Visual Studio에서 이 폴더를 "폴더 열기"로 열기
-2. 구성(Configuration) 드롭다운에서 `default` 선택 (vcpkg로 boost-asio 자동 설치됨)
+
+1. Visual Studio에서 `server` 폴더를 "폴더 열기"로 열기
+2. 구성(Configuration) 드롭다운에서 `default` 선택 (vcpkg가 의존성 자동 설치)
 3. `Ctrl+Shift+B`로 빌드, `Ctrl+F5`로 실행
 
-## Devlog
+`Listening on port 7777...`이 뜨면 정상.
 
-### Step 1 — 접속만 받아서 로그 찍기
+## 테스트
+
+Unity 클라이언트가 아직 없어서, PowerShell 스크립트로 임시 클라이언트를 만들어 쓴다.
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+. .\tools\test-client.ps1
+```
+
+`Set-ExecutionPolicy`는 현재 창에만 적용되고 창을 닫으면 원복된다.
+dot sourcing(`. ` 접두사)으로 불러와야 함수가 현재 세션에 남는다.
+
+```powershell
+Send-Framed $stream '{"type":"Login","data":{"username":"alice"}}'
+Read-Framed $stream
+```
+
+---
+
+# Devlog
+
+<details>
+<summary><b>Step 1 — 접속만 받아서 로그 찍기</b></summary>
+
 
 **Decision:** `boost::asio::ip::tcp::acceptor`로 7777 포트를 열고,
 `accept()`(동기/블로킹)로 접속을 하나씩 받아서 로그 찍고 바로 닫는 방식.
@@ -49,7 +107,11 @@ Windows + Visual Studio + vcpkg:
 **검증:** 새 PowerShell 창에서 `Test-NetConnection -ComputerName 127.0.0.1 -Port 7777` 실행 →
 `TcpTestSucceeded : True` 확인, 서버 콘솔에 `Client connected: 127.0.0.1:...` 로그 찍힘.
 
-### Step 2 — echo 서버
+</details>
+
+<details>
+<summary><b>Step 2 — echo 서버</b></summary>
+
 
 **Decision:** 접속을 받은 뒤 바로 끊지 않고, `socket.read_some()`으로 데이터를 읽어서
 `boost::asio::write()`로 그대로 돌려보내는 걸 클라이언트가 끊을 때까지(`EOF`) 반복.
@@ -66,7 +128,11 @@ Windows + Visual Studio + vcpkg:
 `"hello server"` 전송 → 그대로 `"hello server"` 돌아옴 확인, 서버 로그에
 `Client connected` + 수신 바이트 수 출력 확인.
 
-### Step 3 — 비동기로 전환 (여러 명 동시 접속)
+</details>
+
+<details>
+<summary><b>Step 3 — 비동기로 전환 (여러 명 동시 접속)</b></summary>
+
 
 **Decision:** `acceptor.accept()`(블로킹)로 한 명씩 순서대로 처리하던 구조를,
 `async_accept` + `Session` 클래스(`enable_shared_from_this` 상속) 기반으로 전환.
@@ -87,7 +153,11 @@ Windows + Visual Studio + vcpkg:
 거의 동시에(`Client connected`) 찍힘 → 각자 다른 메시지를 보내고, 서로 막힘 없이
 자기 메시지를 정확히 돌려받음 확인.
 
-### Step 4 — 길이-prefix + JSON 프로토콜
+</details>
+
+<details>
+<summary><b>Step 4 — 길이-prefix + JSON 프로토콜</b></summary>
+
 
 **Decision:** 모든 메시지를 `[4바이트 빅엔디안 길이][UTF-8 JSON 본문]` 형태로 감쌈.
 JSON 본문은 `{"type": "...", "data": {...}}` 구조. 읽기는 `async_read_some` 대신
@@ -116,3 +186,40 @@ JSON을 이런 식으로 받으면 파싱이 깨지므로, 메시지 경계를 �
 **검증:**
 - framed 메시지 두 개를 **하나의 TCP write로** 붙여서 전송 → 서버가 정확히 두 개로 분리해 처리 확인
 - `{"type":"Ping"}` 전송 → `{"data":{},"type":"Pong"}` 수신 (양방향 왕복 성공)
+
+</details>
+
+<details>
+<summary><b>Step 5 — 로그인</b></summary>
+
+
+**Decision:** `Session`이 처음으로 게임 상태(`player_id_`, `username_`, `logged_in_`)를
+갖게 됨. `handle_message`를 타입별 라우팅 구조로 바꾸고, **Login만 로그인 전에 허용,
+나머지 메시지는 전부 차단**하는 게이팅 추가. 거부 사유는 `{"type":"Error"}` 메시지로 회신.
+
+**Why:** 지금까지 서버는 "누가 보낸 메시지인지" 전혀 몰랐음. 채팅/방/경매 전부 "누가"가
+전제되는 기능이라, 그 앞에 신원 확인 단계가 필요했음. Session이 연결마다 독립된 객체라
+"이 연결은 누구인가"를 담기에 자연스러운 자리였음.
+
+**Alternatives considered:**
+- **플레이어 ID를 로그인 시점에 발급**: 더 자연스럽지만, ID 발급기를 Session 밖
+  어딘가(중앙 레지스트리)에 둬야 해서 Session이 바깥을 참조해야 함. 아직 그럴 필요가
+  없어서, 일단 접속 시점에 순번을 붙여 생성자로 넘기는 방식으로 단순하게 감.
+  → 계정 시스템이나 채팅 브로드캐스트가 들어오는 시점에 중앙 레지스트리로 바뀔 예정.
+
+**테스트 환경을 만듦:** 서버는 만들고 있는데 정작 클라이언트가 없어서, 동작을 확인할
+수단 자체가 없었음. PowerShell로 프레이밍(길이-prefix)을 처리하는 임시 클라이언트를 작성.
+처음엔 매번 창에 붙여넣다가 반복이 심해져서 `tools/test-client.ps1`로 분리하고,
+dot sourcing(`. .\tools\test-client.ps1`)으로 불러 쓰는 방식으로 정리함.
+
+**현재 한계 (의도적):**
+- 비밀번호 없음 — 유저네임만 대면 누구든 그 이름으로 로그인됨. 외부 공개 전 반드시 보완 필요.
+- 영속성 없음 — 서버 재시작하면 전부 사라짐. `player_id_`도 "계정 번호"가 아니라
+  사실상 "접속 순번"에 가까움.
+
+**검증:**
+1. 로그인 전 `Ping` → `{"message":"login required"}` 에러 회신 확인
+2. `Login {"username":"alice"}` → `{"playerId":1,"username":"alice"}` 회신 확인
+3. 로그인 후 `Ping` → `Pong` 정상 회신 확인
+
+</details>
