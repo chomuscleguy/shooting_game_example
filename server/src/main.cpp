@@ -151,35 +151,13 @@ private:
             if (type == "RoomJoin") { handle_room_join(data);   return; }
             if (type == "RoomLeave") { handle_room_leave();      return; }
             if (type == "RoomList") { handle_room_list();       return; }
+            if (type == "ChatSend") { handle_chat_send(data);   return; }
 
             send_error("unknown message type: " + type);
         }
         catch (const std::exception& e) {
             std::cerr << "JSON parse error: " << e.what() << '\n';
         }
-    }
-
-    void handle_login(const nlohmann::json& data) {
-        if (logged_in_) {
-            send_error("already logged in");
-            return;
-        }
-
-        std::string username = data.value("username", "");
-        if (username.empty()) {
-            send_error("username required");
-            return;
-        }
-
-        username_ = username;
-        logged_in_ = true;
-
-        std::cout << "Login: " << username_ << " (id=" << player_id_ << ")\n";
-
-        nlohmann::json ok;
-        ok["playerId"] = player_id_;
-        ok["username"] = username_;
-        send({ {"type", "LoginOk"}, {"data", ok} });
     }
 
     void send_error(const std::string& message) {
@@ -189,10 +167,12 @@ private:
     }
 
     // ---- Server를 사용하는 함수들: 선언만, 정의는 Server 뒤에 ----
+    void handle_login(const nlohmann::json& data);
     void handle_room_create(const nlohmann::json& data);
     void handle_room_join(const nlohmann::json& data);
     void handle_room_leave();
     void handle_room_list();
+    void handle_chat_send(const nlohmann::json& data);
     void on_disconnect();
 
     // ---- 멤버 ----
@@ -270,6 +250,39 @@ public:
         return arr;
     }
 
+    // ---- 세션 레지스트리 ----
+    // 방은 멤버를 player_id로만 들고 있어서, 그 번호만으로는 메시지를 보낼 수 없다.
+    // "번호 -> 그 사람의 연결"을 이어주는 표가 여기 필요해짐.
+    void register_session(uint64_t player_id, std::shared_ptr<Session> session) {
+        sessions_[player_id] = std::move(session);
+    }
+
+    void unregister_session(uint64_t player_id) {
+        sessions_.erase(player_id);
+    }
+
+    // ---- 브로드캐스트 ----
+    void broadcast_to_room(uint32_t room_id, const nlohmann::json& message) {
+        Room* room = find_room(room_id);
+        if (!room) return;
+
+        for (uint64_t member_id : room->members) {
+            auto it = sessions_.find(member_id);
+            if (it != sessions_.end()) {
+                it->second->send(message);
+            }
+        }
+    }
+
+    // 방이 이미 삭제됐으면(마지막 사람이 나감) 아무에게도 안 보냄
+    void broadcast_room_state(uint32_t room_id) {
+        Room* room = find_room(room_id);
+        if (!room) return;
+
+        broadcast_to_room(room_id,
+            { {"type", "RoomState"}, {"data", room->to_json()} });
+    }
+
 private:
     void do_accept() {
         acceptor_.async_accept(
@@ -288,11 +301,39 @@ private:
     uint64_t next_player_id_ = 1;
     uint32_t next_room_id_ = 1;
     std::unordered_map<uint32_t, Room> rooms_;
+    std::unordered_map<uint64_t, std::shared_ptr<Session>> sessions_;  // 로그인한 연결만
 };
 
 // ============================================================
 // Session의 미뤄둔 정의들 (Server의 내용을 알아야 하므로 여기에)
 // ============================================================
+void Session::handle_login(const nlohmann::json& data) {
+    if (logged_in_) {
+        send_error("already logged in");
+        return;
+    }
+
+    std::string username = data.value("username", "");
+    if (username.empty()) {
+        send_error("username required");
+        return;
+    }
+
+    username_ = username;
+    logged_in_ = true;
+
+    // 이 시점부터 "번호로 찾아갈 수 있는 사람"이 됨.
+    // 접속 시점이 아니라 로그인 시점에 등록하는 이유: 이름 없는 연결에는 보낼 메시지가 없다.
+    server_.register_session(player_id_, shared_from_this());
+
+    std::cout << "Login: " << username_ << " (id=" << player_id_ << ")\n";
+
+    nlohmann::json ok;
+    ok["playerId"] = player_id_;
+    ok["username"] = username_;
+    send({ {"type", "LoginOk"}, {"data", ok} });
+}
+
 void Session::handle_room_create(const nlohmann::json& data) {
     if (room_id_ != 0) {
         send_error("already in a room");
@@ -308,7 +349,7 @@ void Session::handle_room_create(const nlohmann::json& data) {
     room_id_ = id;
     std::cout << username_ << " created room " << id << " (" << name << ")\n";
 
-    send({ {"type", "RoomState"}, {"data", server_.find_room(id)->to_json()} });
+    server_.broadcast_room_state(id);
 }
 
 void Session::handle_room_join(const nlohmann::json& data) {
@@ -325,7 +366,8 @@ void Session::handle_room_join(const nlohmann::json& data) {
     room_id_ = room_id;
     std::cout << username_ << " joined room " << room_id << '\n';
 
-    send({ {"type", "RoomState"}, {"data", server_.find_room(room_id)->to_json()} });
+    // 들어온 사람만이 아니라 원래 있던 사람들도 새 멤버 목록을 받는다
+    server_.broadcast_room_state(room_id);
 }
 
 void Session::handle_room_leave() {
@@ -334,20 +376,60 @@ void Session::handle_room_leave() {
         return;
     }
     std::cout << username_ << " left room " << room_id_ << '\n';
-    server_.leave_room(room_id_, player_id_);
+
+    uint32_t left_room = room_id_;
+    server_.leave_room(left_room, player_id_);
     room_id_ = 0;
 
+    // 나간 본인은 이미 방 멤버가 아니라 브로드캐스트 대상이 아님 -> 따로 회신
     send({ {"type", "RoomLeaveOk"}, {"data", nlohmann::json::object()} });
+    server_.broadcast_room_state(left_room);
 }
 
 void Session::handle_room_list() {
     send({ {"type", "RoomListResult"}, {"data", server_.room_list_json()} });
 }
 
+void Session::handle_chat_send(const nlohmann::json& data) {
+    if (room_id_ == 0) {
+        send_error("not in a room");
+        return;
+    }
+
+    std::string text = data.value("text", "");
+    if (text.empty()) {
+        send_error("text required");
+        return;
+    }
+    if (text.size() > 500) {
+        send_error("text too long");
+        return;
+    }
+
+    // 보내는 사람이 누군지는 자기 Session이 이미 알고 있다.
+    // sessions_가 필요한 건 "누가 보냈나"가 아니라 "누구에게 전달하나" 쪽.
+    nlohmann::json chat;
+    chat["fromId"] = player_id_;
+    chat["fromName"] = username_;
+    chat["text"] = text;
+
+    server_.broadcast_to_room(room_id_,
+        { {"type", "ChatBroadcast"}, {"data", chat} });
+}
+
 void Session::on_disconnect() {
     if (room_id_ != 0) {
-        server_.leave_room(room_id_, player_id_);
+        uint32_t left_room = room_id_;
+        server_.leave_room(left_room, player_id_);
         room_id_ = 0;
+        server_.broadcast_room_state(left_room);   // 남은 사람들에게 알림
+    }
+
+    // 레지스트리에서도 빼야 Server가 죽은 연결을 붙들고 있지 않는다.
+    // shared_ptr로 들고 있으므로, 여기서 안 빼면 Session이 영원히 안 죽는다.
+    if (logged_in_) {
+        server_.unregister_session(player_id_);
+        logged_in_ = false;
     }
 }
 

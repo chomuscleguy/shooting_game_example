@@ -23,5 +23,23 @@ function Read-Framed($stream) {
     return [System.Text.Encoding]::UTF8.GetString($body)
 }
 
-$client = New-Object System.Net.Sockets.TcpClient("127.0.0.1", 7777)
-$stream = $client.GetStream()
+# 브로드캐스트는 요청 없이 서버가 먼저 보낸다. Read-Framed는 올 때까지 막히므로,
+# "지금 도착해 있는 것만 전부" 꺼내는 함수가 따로 필요하다.
+function Read-Available($stream, $waitMs = 300) {
+    Start-Sleep -Milliseconds $waitMs
+    while ($stream.DataAvailable) { Read-Framed $stream }
+}
+
+# 한 창에서 여러 연결을 다루기 위한 것. 브로드캐스트를 확인하려면
+# 보내는 쪽과 받는 쪽이 동시에 살아있어야 한다.
+$script:clients = @()
+function New-Client($hostname = "127.0.0.1", $port = 7777) {
+    $c = New-Object System.Net.Sockets.TcpClient($hostname, $port)
+    $script:clients += $c
+    return $c.GetStream()
+}
+
+function Close-Clients {
+    foreach ($c in $script:clients) { $c.Close() }
+    $script:clients = @()
+}
