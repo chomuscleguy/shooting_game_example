@@ -12,18 +12,53 @@
 using boost::asio::ip::tcp;
 
 // ============================================================
+// Boss
+// ============================================================
+struct Boss {
+    std::string name;
+    int32_t max_hp = 0;
+    int32_t hp = 0;
+};
+
+// 지금은 보스가 하나뿐이라 상수로 둔다. 종류가 늘면 데이터 파일로 뺄 자리.
+struct BossTemplate {
+    const char* name;
+    int32_t max_hp;
+};
+inline constexpr BossTemplate kDefaultBoss{ "Slime King", 500 };
+
+// ============================================================
 // Room
 // ============================================================
 struct Room {
     uint32_t id = 0;
     std::string name;
     std::vector<uint64_t> members;   // 참여자들의 player_id
+    bool in_battle = false;
+    Boss boss;
+
+    void spawn_boss(const BossTemplate& t) {
+        boss.name = t.name;
+        boss.max_hp = t.max_hp;
+        boss.hp = t.max_hp;
+        in_battle = true;
+    }
 
     nlohmann::json to_json() const {
         nlohmann::json j;
         j["id"] = id;
         j["name"] = name;
         j["members"] = members;
+        j["state"] = in_battle ? "boss_fight" : "waiting";
+        // 보스가 없는 방에 빈 보스를 실어 보내면 클라이언트가 그걸 또 걸러야 한다.
+        // state로 먼저 구분하고, 있을 때만 싣는다.
+        if (in_battle) {
+            j["boss"] = {
+                { "name", boss.name },
+                { "maxHp", boss.max_hp },
+                { "hp", boss.hp },
+            };
+        }
         return j;
     }
 };
@@ -152,6 +187,9 @@ private:
             if (type == "RoomLeave") { handle_room_leave();      return; }
             if (type == "RoomList") { handle_room_list();       return; }
             if (type == "ChatSend") { handle_chat_send(data);   return; }
+            if (type == "ChatSend") { handle_chat_send(data);   return; }
+            if (type == "MatchEnqueue") { handle_match_enqueue(); return; } 
+            if (type == "MatchCancel") { handle_match_cancel();  return; } 
 
             send_error("unknown message type: " + type);
         }
@@ -173,6 +211,8 @@ private:
     void handle_room_leave();
     void handle_room_list();
     void handle_chat_send(const nlohmann::json& data);
+    void handle_match_enqueue();      
+    void handle_match_cancel();       
     void on_disconnect();
 
     // ---- 멤버 ----
@@ -184,7 +224,9 @@ private:
     uint64_t player_id_;
     std::string username_;
     bool logged_in_ = false;
-    uint32_t room_id_ = 0;      // 0 = 어느 방에도 없음
+
+    // 방 소속(room_id_)은 Server가 들고 있다. 매칭처럼 "남을 방에 넣는" 동작이 생기면
+    // 각 Session이 자기 소속을 따로 들고 있는 구조로는 갱신할 방법이 없다.
 
     Server& server_;
 };
@@ -204,6 +246,14 @@ public:
     }
 
     // ---- 방 관리 ----
+    // "누가 어느 방에 있나"는 rooms_[].members에도 들어있지만, 번호로 거꾸로 찾으려면
+    // 방 전체를 뒤져야 한다. 역방향 색인을 따로 둬서 O(1)로 찾는다.
+    // 같은 사실이 두 군데 있으므로, 넣고 빼는 건 반드시 이 클래스 안에서만 한다.
+    uint32_t room_of(uint64_t player_id) const {
+        auto it = player_to_room_.find(player_id);
+        return (it == player_to_room_.end()) ? 0 : it->second;   // 0 = 어느 방에도 없음
+    }
+
     uint32_t create_room(const std::string& name, uint64_t player_id) {
         uint32_t id = next_room_id_++;
         Room room;
@@ -211,6 +261,7 @@ public:
         room.name = name;
         room.members.push_back(player_id);
         rooms_.emplace(id, std::move(room));
+        player_to_room_[player_id] = id;
         return id;
     }
 
@@ -227,19 +278,26 @@ public:
         if (std::find(m.begin(), m.end(), player_id) != m.end()) return false;
 
         m.push_back(player_id);
+        player_to_room_[player_id] = room_id;
         return true;
     }
 
-    void leave_room(uint32_t room_id, uint64_t player_id) {
+    // 어느 방에 있었는지를 돌려준다(없었으면 0). 호출한 쪽이 그 방에 브로드캐스트할 수 있게.
+    uint32_t leave_current_room(uint64_t player_id) {
+        uint32_t room_id = room_of(player_id);
+        if (room_id == 0) return 0;
+
+        player_to_room_.erase(player_id);
+
         Room* room = find_room(room_id);
-        if (!room) return;
-
-        auto& m = room->members;
-        m.erase(std::remove(m.begin(), m.end(), player_id), m.end());
-
-        if (m.empty()) {
-            rooms_.erase(room_id);   // 아무도 없는 방은 삭제
+        if (room) {
+            auto& m = room->members;
+            m.erase(std::remove(m.begin(), m.end(), player_id), m.end());
+            if (m.empty()) {
+                rooms_.erase(room_id);   // 아무도 없는 방은 삭제
+            }
         }
+        return room_id;
     }
 
     nlohmann::json room_list_json() const {
@@ -283,6 +341,55 @@ public:
             { {"type", "RoomState"}, {"data", room->to_json()} });
     }
 
+    // ---- 매칭 큐 ----
+    static constexpr std::size_t kPartySize = 2;
+
+    bool in_queue(uint64_t player_id) const {
+        return std::find(match_queue_.begin(), match_queue_.end(), player_id)
+            != match_queue_.end();
+    }
+
+    std::size_t queue_size() const { return match_queue_.size(); }
+
+    void cancel_match(uint64_t player_id) {
+        match_queue_.erase(
+            std::remove(match_queue_.begin(), match_queue_.end(), player_id),
+            match_queue_.end());
+    }
+
+    // 매칭이 성사되면 방을 만들어 전원을 넣고 MatchFound까지 보낸 뒤 true.
+    // 이 함수만 "남의 방 소속을 바꾸는" 일을 한다 — Session은 자기 것밖에 못 바꾼다.
+    bool enqueue_for_match(uint64_t player_id) {
+        match_queue_.push_back(player_id);
+        if (match_queue_.size() < kPartySize) {
+            return false;
+        }
+
+        std::vector<uint64_t> party(match_queue_.begin(),
+            match_queue_.begin() + kPartySize);
+        match_queue_.erase(match_queue_.begin(), match_queue_.begin() + kPartySize);
+
+        uint32_t id = next_room_id_++;
+        Room room;
+        room.id = id;
+        room.name = "Matchmade Room " + std::to_string(id);
+        room.members = party;
+        room.spawn_boss(kDefaultBoss);
+        rooms_.emplace(id, std::move(room));
+
+        for (uint64_t pid : party) {
+            player_to_room_[pid] = id;
+        }
+
+        std::cout << "Match found -> room " << id << " (" << party.size() << " players)\n";
+
+        broadcast_to_room(id,
+            { {"type", "MatchFound"}, {"data", find_room(id)->to_json()} });
+        return true;
+    }
+
+private:
+
 private:
     void do_accept() {
         acceptor_.async_accept(
@@ -301,7 +408,9 @@ private:
     uint64_t next_player_id_ = 1;
     uint32_t next_room_id_ = 1;
     std::unordered_map<uint32_t, Room> rooms_;
+    std::unordered_map<uint64_t, uint32_t> player_to_room_;
     std::unordered_map<uint64_t, std::shared_ptr<Session>> sessions_;  // 로그인한 연결만
+    std::vector<uint64_t> match_queue_;
 };
 
 // ============================================================
@@ -335,7 +444,7 @@ void Session::handle_login(const nlohmann::json& data) {
 }
 
 void Session::handle_room_create(const nlohmann::json& data) {
-    if (room_id_ != 0) {
+    if (server_.room_of(player_id_) != 0) {
         send_error("already in a room");
         return;
     }
@@ -346,14 +455,13 @@ void Session::handle_room_create(const nlohmann::json& data) {
     }
 
     uint32_t id = server_.create_room(name, player_id_);
-    room_id_ = id;
     std::cout << username_ << " created room " << id << " (" << name << ")\n";
 
     server_.broadcast_room_state(id);
 }
 
 void Session::handle_room_join(const nlohmann::json& data) {
-    if (room_id_ != 0) {
+    if (server_.room_of(player_id_) != 0) {
         send_error("already in a room");
         return;
     }
@@ -363,7 +471,6 @@ void Session::handle_room_join(const nlohmann::json& data) {
         return;
     }
 
-    room_id_ = room_id;
     std::cout << username_ << " joined room " << room_id << '\n';
 
     // 들어온 사람만이 아니라 원래 있던 사람들도 새 멤버 목록을 받는다
@@ -371,15 +478,12 @@ void Session::handle_room_join(const nlohmann::json& data) {
 }
 
 void Session::handle_room_leave() {
-    if (room_id_ == 0) {
+    uint32_t left_room = server_.leave_current_room(player_id_);
+    if (left_room == 0) {
         send_error("not in a room");
         return;
     }
-    std::cout << username_ << " left room " << room_id_ << '\n';
-
-    uint32_t left_room = room_id_;
-    server_.leave_room(left_room, player_id_);
-    room_id_ = 0;
+    std::cout << username_ << " left room " << left_room << '\n';
 
     // 나간 본인은 이미 방 멤버가 아니라 브로드캐스트 대상이 아님 -> 따로 회신
     send({ {"type", "RoomLeaveOk"}, {"data", nlohmann::json::object()} });
@@ -391,7 +495,8 @@ void Session::handle_room_list() {
 }
 
 void Session::handle_chat_send(const nlohmann::json& data) {
-    if (room_id_ == 0) {
+    uint32_t room_id = server_.room_of(player_id_);  
+    if (room_id == 0) {                              
         send_error("not in a room");
         return;
     }
@@ -413,15 +518,50 @@ void Session::handle_chat_send(const nlohmann::json& data) {
     chat["fromName"] = username_;
     chat["text"] = text;
 
-    server_.broadcast_to_room(room_id_,
+    server_.broadcast_to_room(room_id,
         { {"type", "ChatBroadcast"}, {"data", chat} });
 }
 
+void Session::handle_match_enqueue() {
+    if (server_.room_of(player_id_) != 0) {
+        send_error("already in a room");
+        return;
+    }
+    if (server_.in_queue(player_id_)) {
+        send_error("already in queue");
+        return;
+    }
+
+    // 성사되면 MatchFound가 이미 나갔으므로 여기서 더 보낼 게 없다.
+    if (server_.enqueue_for_match(player_id_)) {
+        return;
+    }
+
+    std::cout << username_ << " queued for match\n";
+
+    nlohmann::json d;
+    d["waiting"] = server_.queue_size();
+    d["needed"] = Server::kPartySize;
+    send({ {"type", "MatchQueued"}, {"data", d} });
+}
+
+void Session::handle_match_cancel() {
+    if (!server_.in_queue(player_id_)) {
+        send_error("not in queue");
+        return;
+    }
+    server_.cancel_match(player_id_);
+    std::cout << username_ << " cancelled matchmaking\n";
+
+    send({ {"type", "MatchCancelOk"}, {"data", nlohmann::json::object()} });
+}
+
 void Session::on_disconnect() {
-    if (room_id_ != 0) {
-        uint32_t left_room = room_id_;
-        server_.leave_room(left_room, player_id_);
-        room_id_ = 0;
+    // 대기열에 남아있으면 다음 사람이 유령과 매칭된다
+    server_.cancel_match(player_id_);
+
+    uint32_t left_room = server_.leave_current_room(player_id_);
+    if (left_room != 0) {
         server_.broadcast_room_state(left_room);   // 남은 사람들에게 알림
     }
 
