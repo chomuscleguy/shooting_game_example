@@ -20,28 +20,56 @@ struct Boss {
     int32_t hp = 0;
 };
 
-// 지금은 보스가 하나뿐이라 상수로 둔다. 종류가 늘면 데이터 파일로 뺄 자리.
 struct BossTemplate {
     const char* name;
     int32_t max_hp;
+    uint64_t clear_reward;      // 클리어 시 방 전체가 나눠 갖는 금액
 };
-inline constexpr BossTemplate kDefaultBoss{ "Slime King", 500 };
+inline constexpr BossTemplate kDefaultBoss{ "Slime King", 500, 1000 };
+
+// 공격 한 번의 데미지는 서버가 정한다. 클라이언트는 "때렸다"만 보낸다.
+inline constexpr int32_t kAttackDamage = 50;
 
 // ============================================================
 // Room
 // ============================================================
+enum class RoomPhase { Waiting, BossFight, Cleared };
+
+inline const char* to_string(RoomPhase phase) {
+    switch (phase) {
+    case RoomPhase::BossFight: return "boss_fight";
+    case RoomPhase::Cleared:   return "cleared";
+    default:                   return "waiting";
+    }
+}
+
 struct Room {
     uint32_t id = 0;
     std::string name;
     std::vector<uint64_t> members;   // 참여자들의 player_id
-    bool in_battle = false;
+    RoomPhase phase = RoomPhase::Waiting;      //bool in_battle 대신
     Boss boss;
+
+    bool has_boss() const { return phase != RoomPhase::Waiting; }
 
     void spawn_boss(const BossTemplate& t) {
         boss.name = t.name;
         boss.max_hp = t.max_hp;
         boss.hp = t.max_hp;
-        in_battle = true;
+        phase = RoomPhase::BossFight;          
+    }
+
+    // 데미지를 적용하고, 이번 공격으로 쓰러졌으면 true.
+    // 얼마나 깎을지는 호출하는 쪽이 아니라 서버가 정한 값이 넘어온다.
+    bool attack_boss(int32_t damage) {
+        if (phase != RoomPhase::BossFight) return false;
+
+        boss.hp = std::max(0, boss.hp - damage);
+        if (boss.hp == 0) {
+            phase = RoomPhase::Cleared;
+            return true;
+        }
+        return false;
     }
 
     nlohmann::json to_json() const {
@@ -49,10 +77,10 @@ struct Room {
         j["id"] = id;
         j["name"] = name;
         j["members"] = members;
-        j["state"] = in_battle ? "boss_fight" : "waiting";
+        j["state"] = to_string(phase);         
         // 보스가 없는 방에 빈 보스를 실어 보내면 클라이언트가 그걸 또 걸러야 한다.
         // state로 먼저 구분하고, 있을 때만 싣는다.
-        if (in_battle) {
+        if (has_boss()) {                      // in_battle 대신
             j["boss"] = {
                 { "name", boss.name },
                 { "maxHp", boss.max_hp },
@@ -63,6 +91,56 @@ struct Room {
     }
 };
 
+// ============================================================
+// PlayerRegistry — 계정 정보. 연결이 끊겨도 살아남는다.
+// ============================================================
+// 지금까지 플레이어 정보(번호, 유저네임)는 Session 안에 있었고 연결이 끊기면
+// 같이 사라졌다. 보상으로 받은 재화는 그러면 안 되므로, 연결보다 오래 사는
+// 정보를 담을 자리가 Session 바깥에 필요해졌다.
+class PlayerRegistry {
+public:
+    struct Player {
+        uint64_t id = 0;
+        std::string username;
+        uint64_t currency = 0;
+        bool online = false;
+    };
+
+    // 처음 보는 이름이면 계정을 만들고, 아는 이름이면 그 계정을 그대로 돌려준다.
+    // 비밀번호는 여전히 없다 — 이름만 대면 그 계정이 된다(Step 5의 한계 그대로).
+    Player& login(const std::string& username) {
+        auto it = name_to_id_.find(username);
+        if (it != name_to_id_.end()) {
+            return players_[it->second];
+        }
+
+        uint64_t id = next_id_++;
+        Player& p = players_[id];
+        p.id = id;
+        p.username = username;
+        name_to_id_[username] = id;
+        return p;
+    }
+
+    Player* find(uint64_t player_id) {
+        auto it = players_.find(player_id);
+        return (it == players_.end()) ? nullptr : &it->second;
+    }
+
+    void grant_currency(uint64_t player_id, uint64_t amount) {
+        if (Player* p = find(player_id)) p->currency += amount;
+    }
+
+    void set_online(uint64_t player_id, bool online) {
+        if (Player* p = find(player_id)) p->online = online;
+    }
+
+private:
+    std::unordered_map<uint64_t, Player> players_;
+    std::unordered_map<std::string, uint64_t> name_to_id_;
+    uint64_t next_id_ = 1;
+};
+
 class Server;   // 전방 선언 — Session이 Server&를 갖기 위해 필요
 
 // ============================================================
@@ -70,8 +148,9 @@ class Server;   // 전방 선언 — Session이 Server&를 갖기 위해 필요
 // ============================================================
 class Session : public std::enable_shared_from_this<Session> {
 public:
-    Session(tcp::socket socket, uint64_t player_id, Server& server)
-        : socket_(std::move(socket)), player_id_(player_id), server_(server) {}
+    Session(tcp::socket socket, Server& server)
+        : socket_(std::move(socket)), server_(server) {
+    }
 
     void start() {
         do_read_header();
@@ -94,6 +173,12 @@ public:
         if (!write_in_progress) {
             do_write();
         }
+    }
+
+    void close() {
+        boost::system::error_code ec;
+        socket_.shutdown(tcp::socket::shutdown_both, ec);
+        socket_.close(ec);
     }
 
 private:
@@ -190,6 +275,7 @@ private:
             if (type == "ChatSend") { handle_chat_send(data);   return; }
             if (type == "MatchEnqueue") { handle_match_enqueue(); return; } 
             if (type == "MatchCancel") { handle_match_cancel();  return; } 
+            if (type == "BossAttack") { handle_boss_attack();    return; }
 
             send_error("unknown message type: " + type);
         }
@@ -212,7 +298,8 @@ private:
     void handle_room_list();
     void handle_chat_send(const nlohmann::json& data);
     void handle_match_enqueue();      
-    void handle_match_cancel();       
+    void handle_match_cancel();      
+    void handle_boss_attack();
     void on_disconnect();
 
     // ---- 멤버 ----
@@ -221,7 +308,7 @@ private:
     std::string body_;
     std::deque<std::string> write_queue_;
 
-    uint64_t player_id_;
+    uint64_t player_id_ = 0;
     std::string username_;
     bool logged_in_ = false;
 
@@ -308,6 +395,13 @@ public:
         return arr;
     }
 
+    void kick(uint64_t player_id) {
+        auto it = sessions_.find(player_id);
+        if (it == sessions_.end()) return;
+
+        it->second->close();
+    }
+
     // ---- 세션 레지스트리 ----
     // 방은 멤버를 player_id로만 들고 있어서, 그 번호만으로는 메시지를 보낼 수 없다.
     // "번호 -> 그 사람의 연결"을 이어주는 표가 여기 필요해짐.
@@ -315,8 +409,14 @@ public:
         sessions_[player_id] = std::move(session);
     }
 
-    void unregister_session(uint64_t player_id) {
-        sessions_.erase(player_id);
+    // 쫓겨난 세션이 뒤늦게 정리에 들어올 수 있다. 그 사이 같은 번호로 새 연결이
+    // 등록됐다면, 지금 맵에 있는 건 남의 것이므로 건드리면 안 된다.
+    void unregister_session(uint64_t player_id, const Session* who) {
+        auto it = sessions_.find(player_id);
+        if (it == sessions_.end()) return;
+        if (it->second.get() != who) return;   // 이미 새 세션이 자리를 차지함
+
+        sessions_.erase(it);
     }
 
     // ---- 브로드캐스트 ----
@@ -341,6 +441,52 @@ public:
             { {"type", "RoomState"}, {"data", room->to_json()} });
     }
 
+    // ---- 전투 ----
+    // 데미지는 서버가 정한다(kAttackDamage). 호출하는 쪽은 "누가 때렸다"만 전달.
+    void attack_boss(uint32_t room_id, uint64_t attacker_id,
+        const std::string& attacker_name) {
+        Room* room = find_room(room_id);
+        if (!room) return;
+
+        bool defeated = room->attack_boss(kAttackDamage);
+
+        nlohmann::json d;
+        d["hp"] = room->boss.hp;
+        d["maxHp"] = room->boss.max_hp;
+        d["damage"] = kAttackDamage;
+        d["attackerId"] = attacker_id;
+        d["attackerName"] = attacker_name;
+        broadcast_to_room(room_id, { {"type", "BossState"}, {"data", d} });
+
+        if (defeated) {
+            std::cout << "Boss cleared in room " << room_id << '\n';
+            broadcast_room_state(room_id);   // state: "cleared"
+            distribute_clear_reward(*room);
+        }
+    }
+
+    // 클리어 보상을 방 인원수로 균등 분배한다. 나머지는 버린다.
+    void distribute_clear_reward(const Room& room) {
+        if (room.members.empty()) return;
+
+        uint64_t share = kDefaultBoss.clear_reward / room.members.size();
+
+        for (uint64_t pid : room.members) {
+            players_.grant_currency(pid, share);
+
+            auto it = sessions_.find(pid);
+            if (it == sessions_.end()) continue;   // 끊긴 사람은 알림만 생략
+
+            PlayerRegistry::Player* p = players_.find(pid);
+
+            nlohmann::json d;
+            d["currency"] = share;
+            d["reason"] = "boss_clear";
+            d["balance"] = p ? p->currency : 0;
+            it->second->send({ {"type", "RewardGrant"}, {"data", d} });
+        }
+    }
+
     // ---- 매칭 큐 ----
     static constexpr std::size_t kPartySize = 2;
 
@@ -356,6 +502,9 @@ public:
             std::remove(match_queue_.begin(), match_queue_.end(), player_id),
             match_queue_.end());
     }
+
+    // ---- 계정 ----
+    PlayerRegistry& players() { return players_; }
 
     // 매칭이 성사되면 방을 만들어 전원을 넣고 MatchFound까지 보낸 뒤 true.
     // 이 함수만 "남의 방 소속을 바꾸는" 일을 한다 — Session은 자기 것밖에 못 바꾼다.
@@ -389,8 +538,6 @@ public:
     }
 
 private:
-
-private:
     void do_accept() {
         acceptor_.async_accept(
             [this](boost::system::error_code ec, tcp::socket socket) {
@@ -398,19 +545,19 @@ private:
                     std::cout << "Client connected: "
                         << socket.remote_endpoint() << '\n';
                     std::make_shared<Session>(
-                        std::move(socket), next_player_id_++, *this)->start();
+                        std::move(socket), *this)->start();
                 }
                 do_accept();
             });
     }
 
     tcp::acceptor acceptor_;
-    uint64_t next_player_id_ = 1;
     uint32_t next_room_id_ = 1;
     std::unordered_map<uint32_t, Room> rooms_;
     std::unordered_map<uint64_t, uint32_t> player_to_room_;
     std::unordered_map<uint64_t, std::shared_ptr<Session>> sessions_;  // 로그인한 연결만
     std::vector<uint64_t> match_queue_;
+    PlayerRegistry players_;
 };
 
 // ============================================================
@@ -428,11 +575,20 @@ void Session::handle_login(const nlohmann::json& data) {
         return;
     }
 
-    username_ = username;
+    // 처음 보는 이름이면 계정이 새로 생기고, 아는 이름이면 그 계정으로 들어간다.
+    PlayerRegistry::Player& p = server_.players().login(username);
+
+    // 같은 계정이 이미 접속 중이면 기존 연결을 밀어낸다.
+    if (p.online) {
+        std::cout << "Kicking previous session of " << username << '\n';
+        server_.kick(p.id);
+    }
+    p.online = true;
+
+    player_id_ = p.id;
+    username_ = p.username;
     logged_in_ = true;
 
-    // 이 시점부터 "번호로 찾아갈 수 있는 사람"이 됨.
-    // 접속 시점이 아니라 로그인 시점에 등록하는 이유: 이름 없는 연결에는 보낼 메시지가 없다.
     server_.register_session(player_id_, shared_from_this());
 
     std::cout << "Login: " << username_ << " (id=" << player_id_ << ")\n";
@@ -440,7 +596,18 @@ void Session::handle_login(const nlohmann::json& data) {
     nlohmann::json ok;
     ok["playerId"] = player_id_;
     ok["username"] = username_;
+    ok["currency"] = p.currency;
     send({ {"type", "LoginOk"}, {"data", ok} });
+
+    //자리를 비워둔 방이 있으면 현재 상태를 보내준다
+    uint32_t room_id = server_.room_of(player_id_);
+    if (room_id != 0) {
+        Room* room = server_.find_room(room_id);
+        if (room) {
+            std::cout << username_ << " reconnected to room " << room_id << '\n';
+            send({ {"type", "RoomState"}, {"data", room->to_json()} });
+        }
+    }
 }
 
 void Session::handle_room_create(const nlohmann::json& data) {
@@ -522,6 +689,30 @@ void Session::handle_chat_send(const nlohmann::json& data) {
         { {"type", "ChatBroadcast"}, {"data", chat} });
 }
 
+void Session::handle_boss_attack() {
+    uint32_t room_id = server_.room_of(player_id_);
+    if (room_id == 0) {
+        send_error("not in a room");
+        return;
+    }
+
+    Room* room = server_.find_room(room_id);
+    if (!room) {
+        send_error("room not found");
+        return;
+    }
+    if (room->phase == RoomPhase::Waiting) {
+        send_error("no boss in this room");
+        return;
+    }
+    if (room->phase == RoomPhase::Cleared) {
+        send_error("boss already cleared");
+        return;
+    }
+
+    server_.attack_boss(room_id, player_id_, username_);
+}
+
 void Session::handle_match_enqueue() {
     if (server_.room_of(player_id_) != 0) {
         send_error("already in a room");
@@ -557,18 +748,24 @@ void Session::handle_match_cancel() {
 }
 
 void Session::on_disconnect() {
-    // 대기열에 남아있으면 다음 사람이 유령과 매칭된다
     server_.cancel_match(player_id_);
 
-    uint32_t left_room = server_.leave_current_room(player_id_);
-    if (left_room != 0) {
-        server_.broadcast_room_state(left_room);   // 남은 사람들에게 알림
+    uint32_t room_id = server_.room_of(player_id_);
+    Room* room = server_.find_room(room_id);
+
+    // 전투 중이면 자리를 비워둔다 — 같은 계정으로 돌아오면 그대로 복귀
+    bool keep_seat = (room && room->phase == RoomPhase::BossFight);
+
+    if (!keep_seat) {
+        uint32_t left_room = server_.leave_current_room(player_id_);
+        if (left_room != 0) {
+            server_.broadcast_room_state(left_room);
+        }
     }
 
-    // 레지스트리에서도 빼야 Server가 죽은 연결을 붙들고 있지 않는다.
-    // shared_ptr로 들고 있으므로, 여기서 안 빼면 Session이 영원히 안 죽는다.
     if (logged_in_) {
-        server_.unregister_session(player_id_);
+        server_.players().set_online(player_id_, false);
+        server_.unregister_session(player_id_, this);
         logged_in_ = false;
     }
 }
