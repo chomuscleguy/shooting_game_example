@@ -6,10 +6,28 @@
 #include <vector>
 #include <unordered_map>
 #include <algorithm>
+#include <chrono>
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
 
 using boost::asio::ip::tcp;
+
+// ============================================================
+// Item
+// ============================================================
+// 개체마다 고유 번호를 준다. 같은 이름의 물건이 둘이어도 서로 다른 개체라,
+// 경매에 걸린 그 물건을 지목하고 추적할 수 있어야 하기 때문.
+struct Item {
+    uint64_t id = 0;
+    std::string name;
+
+    nlohmann::json to_json() const {
+        return nlohmann::json{ {"id", id}, {"name", name} };
+    }
+};
+
+// 보스가 떨구는 아이템. 종류가 늘면 데이터 파일로 뺄 자리.
+inline constexpr const char* kBossDropName = "Slime Core";
 
 // ============================================================
 // Boss
@@ -43,14 +61,80 @@ inline const char* to_string(RoomPhase phase) {
     }
 }
 
+// 파티 경매 — 보스 드랍을 파티원끼리 나눠 갖기 위한 것.
+// 낙찰자가 아이템을 갖고, 낸 돈은 나머지 파티원이 나눠 갖는다.
+inline constexpr int kAuctionSeconds = 30;
+
+// 전투 중 끊긴 사람의 자리를 얼마나 지켜줄지. 지나면 방에서 정리한다.
+inline constexpr int kReconnectGraceSeconds = 60;
+
+struct LootAuction {
+    bool active = false;
+    Item item;
+    uint64_t highest_bid = 0;
+    uint64_t highest_bidder = 0;        // 0 = 아직 아무도 안 걸었음
+    std::chrono::steady_clock::time_point ends_at;
+
+    int seconds_left() const {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= ends_at) return 0;
+        return static_cast<int>(
+            std::chrono::duration_cast<std::chrono::seconds>(ends_at - now).count());
+    }
+
+    nlohmann::json to_json() const {
+        nlohmann::json j;
+        j["item"] = item.to_json();
+        j["highestBid"] = highest_bid;
+        j["highestBidder"] = highest_bidder;
+        j["secondsLeft"] = seconds_left();
+        return j;
+    }
+};
+
+
 struct Room {
     uint32_t id = 0;
     std::string name;
     std::vector<uint64_t> members;   // 참여자들의 player_id
     RoomPhase phase = RoomPhase::Waiting;      //bool in_battle 대신
     Boss boss;
+    LootAuction loot;
 
     bool has_boss() const { return phase != RoomPhase::Waiting; }
+
+    // 드랍된 아이템으로 경매를 연다. 마감 시각을 지금 계산해 박아둔다.
+    void start_loot_auction(const Item& drop) {
+        loot = LootAuction{};           // 이전 경매 흔적 초기화
+        loot.active = true;
+        loot.item = drop;
+        loot.ends_at = std::chrono::steady_clock::now()
+            + std::chrono::seconds(kAuctionSeconds);
+    }
+
+    // 입찰을 받는다. 성공하면 밀려난 이전 최고 입찰자를 out으로 알려준다
+    // (0이면 없음). 환불은 호출하는 쪽이 한다 — Room은 재화를 모른다.
+    bool place_bid(uint64_t bidder, uint64_t amount, uint64_t& outbid_player,
+        uint64_t& outbid_amount) {
+        if (!loot.active) return false;
+        if (amount <= loot.highest_bid) return false;
+
+        outbid_player = loot.highest_bidder;
+        outbid_amount = loot.highest_bid;
+
+        loot.highest_bidder = bidder;
+        loot.highest_bid = amount;
+        return true;
+    }
+
+    bool auction_expired() const {
+        return loot.active && std::chrono::steady_clock::now() >= loot.ends_at;
+    }
+
+    // 경매를 닫고 결과를 남긴다. Room은 재화를 모르므로 정산은 밖에서 한다.
+    void close_loot_auction() {
+        loot.active = false;
+    }
 
     void spawn_boss(const BossTemplate& t) {
         boss.name = t.name;
@@ -87,6 +171,11 @@ struct Room {
                 { "hp", boss.hp },
             };
         }
+
+        if (loot.active) {
+            j["loot"] = loot.to_json();
+        }
+
         return j;
     }
 };
@@ -104,6 +193,7 @@ public:
         std::string username;
         uint64_t currency = 0;
         bool online = false;
+        std::vector<Item> inventory;
     };
 
     // 처음 보는 이름이면 계정을 만들고, 아는 이름이면 그 계정을 그대로 돌려준다.
@@ -131,6 +221,25 @@ public:
         if (Player* p = find(player_id)) p->currency += amount;
     }
 
+    // 새 개체를 만든다. 아직 누구의 것도 아니다 — 경매에 걸릴 물건.
+    Item make_item(const std::string& name) {
+        return Item{ next_item_id_++, name };
+    }
+
+    // 이미 존재하는 개체를 인벤토리에 넣는다. 번호가 유지된다.
+    void give_item(uint64_t player_id, const Item& item) {
+        if (Player* p = find(player_id)) p->inventory.push_back(item);
+    }
+
+    // 재화를 깎는다. 잔액이 모자라면 아무 일도 안 하고 false.
+    bool spend_currency(uint64_t player_id, uint64_t amount) {
+        Player* p = find(player_id);
+        if (!p || p->currency < amount) return false;
+
+        p->currency -= amount;
+        return true;
+    }
+
     void set_online(uint64_t player_id, bool online) {
         if (Player* p = find(player_id)) p->online = online;
     }
@@ -139,6 +248,7 @@ private:
     std::unordered_map<uint64_t, Player> players_;
     std::unordered_map<std::string, uint64_t> name_to_id_;
     uint64_t next_id_ = 1;
+    uint64_t next_item_id_ = 1;
 };
 
 class Server;   // 전방 선언 — Session이 Server&를 갖기 위해 필요
@@ -276,6 +386,8 @@ private:
             if (type == "MatchEnqueue") { handle_match_enqueue(); return; } 
             if (type == "MatchCancel") { handle_match_cancel();  return; } 
             if (type == "BossAttack") { handle_boss_attack();    return; }
+            if (type == "LootBid") { handle_loot_bid(data);      return; }
+            if (type == "InventoryList") { handle_inventory_list(); return; }
 
             send_error("unknown message type: " + type);
         }
@@ -300,6 +412,8 @@ private:
     void handle_match_enqueue();      
     void handle_match_cancel();      
     void handle_boss_attack();
+    void handle_loot_bid(const nlohmann::json& data);
+    void handle_inventory_list();
     void on_disconnect();
 
     // ---- 멤버 ----
@@ -324,12 +438,14 @@ private:
 class Server {
 public:
     Server(boost::asio::io_context& io, unsigned short port)
-        : acceptor_(io, tcp::endpoint(tcp::v4(), port)) {}
+        : acceptor_(io, tcp::endpoint(tcp::v4(), port)), tick_timer_(io) {
+    }
 
     void start() {
         std::cout << "Listening on port "
             << acceptor_.local_endpoint().port() << "...\n";
         do_accept();
+        start_tick_timer();
     }
 
     // ---- 방 관리 ----
@@ -459,10 +575,114 @@ public:
         broadcast_to_room(room_id, { {"type", "BossState"}, {"data", d} });
 
         if (defeated) {
-            std::cout << "Boss cleared in room " << room_id << '\n';
-            broadcast_room_state(room_id);   // state: "cleared"
+            std::cout << "Boss cleared in room " << room_id << std::endl;
             distribute_clear_reward(*room);
+
+            // 드랍 아이템으로 파티 경매 시작
+            Item drop = players_.make_item(kBossDropName);
+            room->start_loot_auction(drop);
+
+            broadcast_room_state(room_id);   // state:"cleared" + loot 포함
+            broadcast_to_room(room_id,
+                { {"type", "LootAuctionStarted"}, {"data", room->loot.to_json()} });
         }
+    }
+
+    // 입찰: 돈을 먼저 잡아두고(에스크로), 밀려난 사람에게는 돌려준다.
+   // 실패 사유는 호출한 Session이 판정해서 회신한다.
+    bool bid_on_loot(uint32_t room_id, uint64_t bidder, uint64_t amount) {
+        Room* room = find_room(room_id);
+        if (!room || !room->loot.active) return false;
+        if (amount <= room->loot.highest_bid) return false;
+
+        // 돈부터 잡아둔다. 모자라면 여기서 실패.
+        if (!players_.spend_currency(bidder, amount)) return false;
+
+        uint64_t outbid_player = 0;
+        uint64_t outbid_amount = 0;
+        if (!room->place_bid(bidder, amount, outbid_player, outbid_amount)) {
+            players_.grant_currency(bidder, amount);   // 되돌리기
+            return false;
+        }
+
+        // 밀려난 사람에게 환불
+        if (outbid_player != 0) {
+            players_.grant_currency(outbid_player, outbid_amount);
+            auto it = sessions_.find(outbid_player);
+            if (it != sessions_.end()) {
+                PlayerRegistry::Player* p = players_.find(outbid_player);
+                nlohmann::json d;
+                d["currency"] = outbid_amount;
+                d["reason"] = "outbid";
+                d["balance"] = p ? p->currency : 0;
+                it->second->send({ {"type", "RewardGrant"}, {"data", d} });
+            }
+        }
+
+        broadcast_to_room(room_id,
+            { {"type", "LootBidUpdate"}, {"data", room->loot.to_json()} });
+        return true;
+    }
+
+    // 마감 처리: 낙찰이면 아이템을 주고 낙찰금을 나머지 파티원이 나눠 갖는다.
+    // 아무도 안 걸었으면 아이템은 소멸한다.
+    void close_auction(Room& room) {
+        LootAuction result = room.loot;     // 닫기 전에 결과를 복사해둔다
+        room.close_loot_auction();
+
+        nlohmann::json d;
+        d["item"] = result.item.to_json();
+
+        if (result.highest_bidder == 0) {
+            d["winnerId"] = 0;
+            d["winningBid"] = 0;
+            d["result"] = "expired";        // 유찰 — 아이템 소멸
+            broadcast_to_room(room.id,
+                { {"type", "LootAuctionClosed"}, {"data", d} });
+            return;
+        }
+
+        // 낙찰자에게 아이템
+        players_.give_item(result.highest_bidder, result.item);
+
+        // 낙찰금은 낙찰자를 뺀 나머지가 균등 분배 (돈은 입찰 때 이미 잡아뒀다)
+        std::vector<uint64_t> others;
+        for (uint64_t pid : room.members) {
+            if (pid != result.highest_bidder) others.push_back(pid);
+        }
+
+        if (!others.empty()) {
+            uint64_t share = result.highest_bid / others.size();
+            for (uint64_t pid : others) {
+                players_.grant_currency(pid, share);
+
+                auto it = sessions_.find(pid);
+                if (it == sessions_.end()) continue;
+
+                PlayerRegistry::Player* p = players_.find(pid);
+                nlohmann::json r;
+                r["currency"] = share;
+                r["reason"] = "loot_share";
+                r["balance"] = p ? p->currency : 0;
+                it->second->send({ {"type", "RewardGrant"}, {"data", r} });
+            }
+        }
+
+        d["winnerId"] = result.highest_bidder;
+        d["winningBid"] = result.highest_bid;
+        d["result"] = "sold";
+        broadcast_to_room(room.id,
+            { {"type", "LootAuctionClosed"}, {"data", d} });
+    }
+
+    // 전투 중 끊김 — 자리를 지켜주되 마감 시각을 박아둔다.
+    void hold_seat(uint64_t player_id) {
+        pending_reconnect_[player_id] = std::chrono::steady_clock::now()
+            + std::chrono::seconds(kReconnectGraceSeconds);
+    }
+
+    void clear_seat_hold(uint64_t player_id) {
+        pending_reconnect_.erase(player_id);
     }
 
     // 클리어 보상을 방 인원수로 균등 분배한다. 나머지는 버린다.
@@ -551,12 +771,52 @@ private:
             });
     }
 
+    void start_tick_timer() {
+        tick_timer_.expires_after(std::chrono::seconds(1));
+        tick_timer_.async_wait([this](boost::system::error_code ec) {
+            if (ec) return;        // 타이머가 취소됨 (서버 종료 등)
+            on_tick();
+            start_tick_timer();    // 다음 틱 예약
+            });
+    }
+
+    void on_tick() {
+        // 마감된 경매를 찾아 정산한다. 여기가 "아무도 안 보냈는데 서버가 움직이는" 곳.
+        for (auto& entry : rooms_) {
+            if (entry.second.auction_expired()) {
+                close_auction(entry.second);
+            }
+        }
+
+        // 돌아오지 않은 사람의 자리를 정리한다.
+        // 순회 중에 지울 수 없으니 먼저 모아두고 그 다음에 처리한다.
+        auto now = std::chrono::steady_clock::now();
+        std::vector<uint64_t> expired;
+        for (const auto& entry : pending_reconnect_) {
+            if (now >= entry.second) expired.push_back(entry.first);
+        }
+
+        for (uint64_t pid : expired) {
+            pending_reconnect_.erase(pid);
+
+            uint32_t left_room = leave_current_room(pid);
+            if (left_room != 0) {
+                std::cout << "Reconnect timeout: player " << pid
+                    << " removed from room " << left_room << std::endl;
+                broadcast_room_state(left_room);
+            }
+        }
+    }
+
     tcp::acceptor acceptor_;
+    boost::asio::steady_timer tick_timer_;
     uint32_t next_room_id_ = 1;
     std::unordered_map<uint32_t, Room> rooms_;
     std::unordered_map<uint64_t, uint32_t> player_to_room_;
     std::unordered_map<uint64_t, std::shared_ptr<Session>> sessions_;  // 로그인한 연결만
     std::vector<uint64_t> match_queue_;
+    // 전투 중 끊겨서 자리를 비워둔 사람들. 값은 "이때까지 안 오면 정리" 시각.
+    std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> pending_reconnect_;
     PlayerRegistry players_;
 };
 
@@ -604,6 +864,7 @@ void Session::handle_login(const nlohmann::json& data) {
     if (room_id != 0) {
         Room* room = server_.find_room(room_id);
         if (room) {
+            server_.clear_seat_hold(player_id_);
             std::cout << username_ << " reconnected to room " << room_id << '\n';
             send({ {"type", "RoomState"}, {"data", room->to_json()} });
         }
@@ -713,6 +974,60 @@ void Session::handle_boss_attack() {
     server_.attack_boss(room_id, player_id_, username_);
 }
 
+void Session::handle_loot_bid(const nlohmann::json& data) {
+    uint32_t room_id = server_.room_of(player_id_);
+    if (room_id == 0) {
+        send_error("not in a room");
+        return;
+    }
+
+    Room* room = server_.find_room(room_id);
+    if (!room || !room->loot.active) {
+        send_error("no auction running");
+        return;
+    }
+
+    uint64_t amount = data.value("amount", 0ull);
+    if (amount == 0) {
+        send_error("amount required");
+        return;
+    }
+    if (amount <= room->loot.highest_bid) {
+        send_error("bid too low");
+        return;
+    }
+
+    PlayerRegistry::Player* me = server_.players().find(player_id_);
+    if (!me || me->currency < amount) {
+        send_error("not enough currency");
+        return;
+    }
+
+    if (!server_.bid_on_loot(room_id, player_id_, amount)) {
+        send_error("bid rejected");
+        return;
+    }
+}
+
+void Session::handle_inventory_list() {
+    PlayerRegistry::Player* p = server_.players().find(player_id_);
+    if (!p) {
+        send_error("player not found");
+        return;
+    }
+
+    nlohmann::json items = nlohmann::json::array();
+    for (const Item& item : p->inventory) {
+        items.push_back(item.to_json());
+    }
+
+    nlohmann::json d;
+    d["items"] = items;
+    d["currency"] = p->currency;
+    send({ {"type", "InventoryResult"}, {"data", d} });
+}
+
+
 void Session::handle_match_enqueue() {
     if (server_.room_of(player_id_) != 0) {
         send_error("already in a room");
@@ -761,6 +1076,9 @@ void Session::on_disconnect() {
         if (left_room != 0) {
             server_.broadcast_room_state(left_room);
         }
+    }
+    else {
+        server_.hold_seat(player_id_); 
     }
 
     if (logged_in_) {
